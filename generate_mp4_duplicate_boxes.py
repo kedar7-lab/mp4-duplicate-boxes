@@ -258,7 +258,7 @@ class MP4BoxWriter:
         trak_data = tkhd + mdia1
         
         if duplicate_mdia:
-            # Add a duplicate mdia box
+            # Add a duplicate mdia box AFTER the first complete mdia
             mdia2 = MP4BoxWriter.create_mdia_box('vide')
             trak_data += mdia2
         
@@ -279,25 +279,31 @@ class MP4BoxWriter:
 
 
 def generate_mp4_with_duplicate_minf(output_file):
-    """Generate MP4 with duplicate minf boxes inside a single mdia."""
+    """Generate MP4 with duplicate minf boxes inside a single mdia.
+    
+    Structure: mdia -> [mdhd, hdlr, minf (vmhd->dinf->stbl), minf (smhd->dinf->stbl)]
+    The second minf comes AFTER stbl of the first minf.
+    """
     print(f"[*] Generating MP4 with duplicate minf boxes: {output_file}")
     
     # Create base structure
     ftyp = MP4BoxWriter.create_ftyp_box()
     
-    # Manually create trak with duplicate minf
+    # Manually create trak with duplicate minf boxes positioned after stbl
     tkhd = MP4BoxWriter.create_tkhd_box()
     
     # Create mdia with duplicate minf boxes
     mdhd = MP4BoxWriter.create_mdhd_box()
     hdlr = MP4BoxWriter.create_hdlr_box('vide')
+    
+    # First minf box (video)
     minf1 = MP4BoxWriter.create_minf_box('vide')
-    minf2 = MP4BoxWriter.create_minf_box('vide')  # Duplicate with conflicting header
     
-    # Manually modify minf2 to have audio header to highlight the conflict
-    minf2_modified = minf2.replace(b'vmhd', b'smhd', 1)
+    # Second minf box (audio) - positioned AFTER stbl of first minf
+    minf2 = MP4BoxWriter.create_minf_box('soun')
     
-    mdia_data = mdhd + hdlr + minf1 + minf2_modified
+    # Build mdia: mdhd -> hdlr -> minf1 (complete) -> minf2 (complete)
+    mdia_data = mdhd + hdlr + minf1 + minf2
     mdia_size = 8 + len(mdia_data)
     mdia_box = struct.pack('>I4s', mdia_size, b'mdia')
     mdia = mdia_box + mdia_data
@@ -321,12 +327,16 @@ def generate_mp4_with_duplicate_minf(output_file):
         f.write(mp4_data)
     
     print(f"[+] Created: {output_file} ({len(mp4_data)} bytes)")
-    print(f"    Structure: ftyp -> moov -> trak -> mdia -> [mdhd, hdlr, minf (vmhd), minf (smhd)]")
-    print(f"    Issue: Two minf boxes in single mdia (should be exactly one)")
+    print(f"    Structure: ftyp -> moov -> trak -> mdia -> [mdhd, hdlr, minf(vmhd+dinf+stbl), minf(smhd+dinf+stbl)]")
+    print(f"    Issue: Two minf boxes in single mdia (second minf positioned AFTER stbl)")
 
 
 def generate_mp4_with_duplicate_mdia(output_file):
-    """Generate MP4 with duplicate mdia boxes inside a single trak."""
+    """Generate MP4 with duplicate mdia boxes inside a single trak.
+    
+    Structure: trak -> [tkhd, mdia (complete mdhd+hdlr+minf+stbl), mdia (complete mdhd+hdlr+minf+stbl)]
+    The second mdia comes AFTER stbl of the first mdia.
+    """
     print(f"[*] Generating MP4 with duplicate mdia boxes: {output_file}")
     
     ftyp = MP4BoxWriter.create_ftyp_box()
@@ -338,8 +348,8 @@ def generate_mp4_with_duplicate_mdia(output_file):
         f.write(mp4_data)
     
     print(f"[+] Created: {output_file} ({len(mp4_data)} bytes)")
-    print(f"    Structure: ftyp -> moov -> trak -> [tkhd, mdia, mdia]")
-    print(f"    Issue: Two mdia boxes in single trak (should be exactly one)")
+    print(f"    Structure: ftyp -> moov -> trak -> [tkhd, mdia(mdhd+hdlr+minf+stbl), mdia(mdhd+hdlr+minf+stbl)]")
+    print(f"    Issue: Two mdia boxes in single trak (second mdia positioned AFTER stbl of first mdia)")
 
 
 def main():
@@ -347,9 +357,9 @@ def main():
     output_dir = os.path.join(os.path.dirname(__file__), 'output')
     os.makedirs(output_dir, exist_ok=True)
     
-    print("=" * 70)
+    print("=" * 80)
     print("MP4 Duplicate Box Generator")
-    print("=" * 70)
+    print("=" * 80)
     print()
     
     # Generate both types
@@ -361,19 +371,19 @@ def main():
     generate_mp4_with_duplicate_mdia(mp4_mdia_file)
     print()
     
-    print("=" * 70)
+    print("=" * 80)
     print("Generated files:")
     print(f"  - {mp4_minf_file}")
     print(f"  - {mp4_mdia_file}")
     print()
     print("These files have intentional structural violations:")
-    print("  1. Duplicate minf: Multiple media information boxes in one mdia")
-    print("  2. Duplicate mdia: Multiple media boxes in one trak")
+    print("  1. Duplicate minf: Multiple minf boxes in one mdia (after stbl)")
+    print("  2. Duplicate mdia: Multiple mdia boxes in one trak (after stbl)")
     print()
     print("Use with parsers/validators to test robustness:")
     print("  ffprobe -show_boxes <file>")
     print("  mp4dump <file>")
-    print("=" * 70)
+    print("=" * 80)
 
 
 if __name__ == '__main__':
