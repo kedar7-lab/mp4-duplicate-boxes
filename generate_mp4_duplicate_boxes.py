@@ -231,20 +231,22 @@ def generate_mp4_with_duplicate_minf(output_file):
     """
     Generate MP4 with DUPLICATE MINF boxes inside a SINGLE MDIA.
     
+    Both minf boxes have IDENTICAL SIZE (both use 'vide' handler type).
+    
     Structure (INVALID):
     mdia
       ├── mdhd
       ├── hdlr
-      ├── minf (Video) ← First minf
+      ├── minf (Video) ← First minf (size=8+148)
       │   ├── vmhd
       │   ├── dinf
       │   └── stbl
-      └── minf (Audio) ← DUPLICATE minf (should be only ONE minf per mdia!)
-          ├── smhd
+      └── minf (Video) ← DUPLICATE minf (size=8+148) - IDENTICAL SIZE
+          ├── vmhd
           ├── dinf
           └── stbl
     
-    Key: Both minf boxes are children of the SAME mdia box.
+    Key: Both minf boxes are children of the SAME mdia box with identical sizes.
     mdia_size must encompass BOTH minf boxes.
     """
     print(f"[*] Generating MP4 with duplicate minf boxes: {output_file}")
@@ -254,11 +256,11 @@ def generate_mp4_with_duplicate_minf(output_file):
     # Create track header
     tkhd = MP4BoxWriter.create_tkhd_box()
     
-    # Create mdia CONTAINING DUPLICATE MINF BOXES
+    # Create mdia CONTAINING DUPLICATE MINF BOXES (both with same handler type for identical size)
     mdhd = MP4BoxWriter.create_mdhd_box()
     hdlr = MP4BoxWriter.create_hdlr_box('vide')
     minf1 = MP4BoxWriter.create_minf_box('vide')  # Video minf
-    minf2 = MP4BoxWriter.create_minf_box('soun')  # Audio minf (DUPLICATE!)
+    minf2 = MP4BoxWriter.create_minf_box('vide')  # Video minf (DUPLICATE with identical size!)
     
     # Build mdia with both minf boxes as direct children
     mdia_content = mdhd + hdlr + minf1 + minf2
@@ -291,8 +293,8 @@ def generate_mp4_with_duplicate_minf(output_file):
     print(f"            └── mdia")
     print(f"                ├── mdhd")
     print(f"                ├── hdlr")
-    print(f"                ├── minf (vmhd+dinf+stbl) ← First")
-    print(f"                └── minf (smhd+dinf+stbl) ← DUPLICATE ⚠️")
+    print(f"                ├── minf (vmhd+dinf+stbl) size=8+148 ← First")
+    print(f"                └── minf (vmhd+dinf+stbl) size=8+148 ← DUPLICATE (IDENTICAL SIZE) ⚠️")
     print(f"    ⚠️  Issue: mdia has TWO minf boxes (spec requires exactly ONE)")
 
 
@@ -300,17 +302,19 @@ def generate_mp4_with_duplicate_mdia(output_file):
     """
     Generate MP4 with DUPLICATE MDIA boxes inside a SINGLE TRAK.
     
+    Both mdia boxes have IDENTICAL SIZE (both created identically).
+    
     Structure (INVALID):
     trak
       ├── tkhd
-      ├── mdia (First) ← First mdia
+      ├── mdia (First) ← First mdia (size=8+313)
       │   ├── mdhd
       │   ├── hdlr
       │   └── minf
       │       ├── vmhd
       │       ├── dinf
       │       └── stbl
-      └── mdia (Second) ← DUPLICATE mdia (should be only ONE mdia per trak!)
+      └── mdia (Second) ← DUPLICATE mdia (size=8+313) - IDENTICAL SIZE
           ├── mdhd
           ├── hdlr
           └── minf
@@ -318,7 +322,7 @@ def generate_mp4_with_duplicate_mdia(output_file):
               ├── dinf
               └── stbl
     
-    Key: Both mdia boxes are children of the SAME trak box.
+    Key: Both mdia boxes are children of the SAME trak box with identical sizes.
     trak_size must encompass BOTH mdia boxes.
     """
     print(f"[*] Generating MP4 with duplicate mdia boxes: {output_file}")
@@ -328,7 +332,7 @@ def generate_mp4_with_duplicate_mdia(output_file):
     # Create track header
     tkhd = MP4BoxWriter.create_tkhd_box()
     
-    # Create TWO complete mdia boxes
+    # Create TWO complete mdia boxes (IDENTICAL - both using 'vide' handler type)
     mdia1_content = MP4BoxWriter.create_mdhd_box() + MP4BoxWriter.create_hdlr_box('vide') + MP4BoxWriter.create_minf_box('vide')
     mdia1_size = 8 + len(mdia1_content)
     mdia1_box = struct.pack('>I4s', mdia1_size, b'mdia') + mdia1_content
@@ -360,14 +364,14 @@ def generate_mp4_with_duplicate_mdia(output_file):
     print(f"        ├── mvhd")
     print(f"        └── trak")
     print(f"            ├── tkhd")
-    print(f"            ├── mdia (First) ← First mdia")
+    print(f"            ├── mdia size=8+313 ← First mdia")
     print(f"            │   ├── mdhd")
     print(f"            │   ├── hdlr")
     print(f"            │   └── minf")
     print(f"            │       ├── vmhd")
     print(f"            │       ├── dinf")
     print(f"            │       └── stbl")
-    print(f"            └── mdia (Second) ← DUPLICATE ⚠️")
+    print(f"            └── mdia size=8+313 ← DUPLICATE mdia (IDENTICAL SIZE) ⚠️")
     print(f"                ├── mdhd")
     print(f"                ├── hdlr")
     print(f"                └── minf")
@@ -382,9 +386,9 @@ def main():
     output_dir = os.path.join(os.path.dirname(__file__), 'output')
     os.makedirs(output_dir, exist_ok=True)
     
-    print("=" * 90)
-    print("MP4 Duplicate Box Generator (CORRECTED)")
-    print("=" * 90)
+    print("=" * 100)
+    print("MP4 Duplicate Box Generator (IDENTICAL SIZES)")
+    print("=" * 100)
     print()
     
     mp4_minf_file = os.path.join(output_dir, 'mp4_with_duplicate_minf.mp4')
@@ -395,7 +399,7 @@ def main():
     generate_mp4_with_duplicate_mdia(mp4_mdia_file)
     print()
     
-    print("=" * 90)
+    print("=" * 100)
     print("Generated files:")
     print(f"  • {mp4_minf_file}")
     print(f"  • {mp4_mdia_file}")
@@ -405,9 +409,9 @@ def main():
     print("  ffprobe -show_boxes <file>")
     print()
     print("Expected findings:")
-    print("  1. Duplicate minf: TWO [minf] boxes listed under one [mdia]")
-    print("  2. Duplicate mdia: TWO [mdia] boxes listed under one [trak]")
-    print("=" * 90)
+    print("  1. Duplicate minf: TWO [minf] boxes with IDENTICAL SIZE under one [mdia]")
+    print("  2. Duplicate mdia: TWO [mdia] boxes with IDENTICAL SIZE under one [trak]")
+    print("=" * 100)
 
 
 if __name__ == '__main__':
