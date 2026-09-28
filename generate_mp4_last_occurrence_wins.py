@@ -1,233 +1,192 @@
 #!/usr/bin/env python3
-"""Generate a real H.264 MP4 with an empty duplicate minf after stbl.
+"""Create the minimal duplicate-minf MP4 reproducer.
 
-The generated video track has:
+This intentionally hand-builds the box layout from the regression description;
+it does not use FFmpeg.  The resulting track is:
 
-    mdia
-      mdhd
-      hdlr (vide)
-      minf                 # original, complete
-        ... stbl ...
-      minf                 # duplicate, exactly size=8, no children
+  trak
+    tkhd (92)
+    mdia (32 + 33 + first minf + empty duplicate minf)
+      minf
+        stbl
+          stsd (16, entry_count=0)
+          stts (24, 4 samples, delta 1)
+          stsc (28, 4 samples/chunk)
+          stsz (36, four 16-byte samples)
+          stco (20, one chunk at 0x200)
+      minf (8, no children)
 
-That is the minimal layout needed to exercise parsers that store
-m_non_leaves["minf"] with last-occurrence-wins semantics. The duplicate is
-intentionally malformed as a media container; use the output only in an
-isolated parser regression test.
+The important relative offsets are:
+
+  stbl start relative to trak: 181
+  prependsz = stbl start + stbl header: 189
+  stbl end relative to trak: 313
+  minf_offset = stbl end - (trak start + 8): 305
+
+Thus the vulnerable assertion sees assert(305 < 189).
+
+The file is deliberately malformed and is intended only for an isolated parser
+regression test.  It contains an 8-byte mdat with no media payload because the
+crash occurs while processing the duplicate minf layout.
 """
 
 from __future__ import annotations
 
 import argparse
-import shutil
 import struct
-import subprocess
-import sys
-import tempfile
 from pathlib import Path
 
-DEFAULT_TARGET = 1_048_576
-DEFAULT_DURATION = 10.0
-CONTAINERS = {b"moov", b"trak", b"mdia", b"minf", b"stbl", b"dinf", b"edts", b"udta"}
+
+def box(kind: bytes, payload: bytes = b"") -> bytes:
+    if len(kind) != 4:
+        raise ValueError("box type must be four bytes")
+    size = 8 + len(payload)
+    if size >= 2**32:
+        raise ValueError("box is too large")
+    return struct.pack(">I4s", size, kind) + payload
 
 
-def tool(name: str) -> str:
-    result = shutil.which(name)
-    if not result:
-        raise RuntimeError(f"{name} is required and was not found on PATH")
-    return result
+def fullbox_payload(version: int = 0, flags: int = 0) -> bytes:
+    return struct.pack(">I", (version << 24) | flags)
 
 
-def run(command: list[str]) -> None:
-    print("+", " ".join(command))
-    subprocess.run(command, check=True)
+def make_ftyp() -> bytes:
+    # 8-byte header + 16-byte payload = 24 bytes.
+    return box(b"ftyp", b"isom" + struct.pack(">I", 0x200) + b"isommp42")
 
 
-class Box:
-    __slots__ = ("type", "payload", "children")
-
-    def __init__(self, box_type: bytes, payload: bytes = b"", children: list["Box"] | None = None):
-        self.type = box_type
-        self.payload = payload
-        self.children = children
-
-    @property
-    def size(self) -> int:
-        return 8 + (len(self.payload) if self.children is None else sum(c.size for c in self.children))
-
-    def to_bytes(self) -> bytes:
-        body = self.payload if self.children is None else b"".join(c.to_bytes() for c in self.children)
-        if len(body) + 8 >= 2**32:
-            raise ValueError("box is too large")
-        return struct.pack(">I4s", len(body) + 8, self.type) + body
-
-    def find_all(self, box_type: bytes) -> list["Box"]:
-        result = [self] if self.type == box_type else []
-        for child in self.children or ():
-            result.extend(child.find_all(box_type))
-        return result
+def make_mvhd() -> bytes:
+    # Version 0 mvhd payload is 100 bytes, hence a 108-byte box.
+    payload = bytearray(100)
+    payload[0:4] = fullbox_payload()
+    struct.pack_into(">I", payload, 12, 1)   # timescale
+    struct.pack_into(">I", payload, 16, 10)  # duration
+    return box(b"mvhd", bytes(payload))
 
 
-def parse_boxes(data: bytes) -> list[Box]:
-    result: list[Box] = []
-    pos = 0
-    while pos + 8 <= len(data):
-        size, box_type = struct.unpack_from(">I4s", data, pos)
-        if size == 0:
-            size = len(data) - pos
-        elif size == 1:
-            raise ValueError("extended-size child boxes are not supported")
-        if size < 8 or pos + size > len(data):
-            raise ValueError(f"invalid {box_type!r} box at offset {pos}")
-        body = data[pos + 8:pos + size]
-        if box_type in CONTAINERS:
-            result.append(Box(box_type, children=parse_boxes(body)))
-        else:
-            result.append(Box(box_type, body))
-        pos += size
-    if pos != len(data):
-        raise ValueError("trailing bytes in container")
-    return result
+def make_tkhd() -> bytes:
+    # Version 0 tkhd payload is 84 bytes, hence a 92-byte box.
+    payload = bytearray(84)
+    payload[0:4] = fullbox_payload(flags=0x000007)
+    struct.pack_into(">I", payload, 12, 1)  # track_ID
+    return box(b"tkhd", bytes(payload))
 
 
-def top_level(path: Path) -> list[tuple[bytes, int, int]]:
-    result: list[tuple[bytes, int, int]] = []
-    total = path.stat().st_size
-    with path.open("rb") as handle:
-        pos = 0
-        while pos < total:
-            handle.seek(pos)
-            header = handle.read(8)
-            if len(header) != 8:
-                raise ValueError("truncated top-level box header")
-            size, box_type = struct.unpack(">I4s", header)
-            if size == 0:
-                size = total - pos
-            elif size == 1:
-                size = 16 + struct.unpack(">Q", handle.read(8))[0]
-            if size < 8 or pos + size > total:
-                raise ValueError(f"invalid top-level {box_type!r}")
-            result.append((box_type, pos, size))
-            pos += size
-    return result
+def make_mdhd() -> bytes:
+    # 8-byte header + 24-byte payload = 32 bytes.
+    payload = bytearray(24)
+    payload[0:4] = fullbox_payload()
+    struct.pack_into(">I", payload, 12, 1)  # timescale
+    struct.pack_into(">I", payload, 16, 10) # duration
+    return box(b"mdhd", bytes(payload))
 
 
-def shift_offsets(moov: Box, delta: int) -> int:
-    """Keep the original valid stco/co64 entries pointing into mdat."""
-    if delta == 0:
-        return 0
-    changed = 0
-    for box in moov.find_all(b"stco"):
-        if len(box.payload) < 8:
-            continue
-        count = struct.unpack_from(">I", box.payload, 4)[0]
-        values = struct.unpack_from(f">{count}I", box.payload, 8)
-        if any(value + delta >= 2**32 for value in values):
-            raise ValueError("stco offset overflow")
-        box.payload = box.payload[:8] + struct.pack(f">{count}I", *(v + delta for v in values))
-        changed += count
-    for box in moov.find_all(b"co64"):
-        if len(box.payload) < 8:
-            continue
-        count = struct.unpack_from(">I", box.payload, 4)[0]
-        values = struct.unpack_from(f">{count}Q", box.payload, 8)
-        box.payload = box.payload[:8] + struct.pack(f">{count}Q", *(v + delta for v in values))
-        changed += count
-    return changed
+def make_hdlr() -> bytes:
+    # 4 vf + 4 pre_defined + 4 handler_type + 12 reserved + 1 name = 25.
+    payload = fullbox_payload() + struct.pack(">I4s12sB", 0, b"vide", b"" * 12, 0)
+    assert len(payload) == 25
+    return box(b"hdlr", payload)
 
 
-def append_empty_minf(moov: Box, include_audio: bool) -> int:
-    """Append exactly 00 00 00 08 'minf' after the original minf.
-
-    By default only the video mdia is modified, matching the supplied
-    first/only-mdia vide reproducer. --all-tracks can add the same trigger to
-    the audio mdia as well.
-    """
-    added = 0
-    for trak in moov.find_all(b"trak"):
-        mdia = next((c for c in trak.children or () if c.type == b"mdia"), None)
-        if mdia is None:
-            continue
-        handler = next((c for c in mdia.children or () if c.type == b"hdlr"), None)
-        handler_name = handler.payload[8:12] if handler and len(handler.payload) >= 12 else b""
-        if handler_name == b"soun" and not include_audio:
-            continue
-        original = next((c for c in mdia.children or () if c.type == b"minf"), None)
-        if original is None:
-            continue
-        # children=[] is important: it serializes to an 8-byte minf header.
-        mdia.children.append(Box(b"minf", children=[]))
-        added += 1
-        print(f"Added empty duplicate minf after original {handler_name.decode(errors='replace')} minf")
-    if not added:
-        raise ValueError("no eligible mdia/minf found")
-    return added
+def make_stsd() -> bytes:
+    # version/flags + entry_count; deliberately zero sample entries.
+    return box(b"stsd", fullbox_payload() + struct.pack(">I", 0))
 
 
-def encode_source(path: Path, target_bytes: int, duration: float) -> None:
-    ffmpeg = tool("ffmpeg")
-    if target_bytes < 64 * 1024 or duration <= 0:
-        raise ValueError("use --size >= 65536 and --duration > 0")
-    video_bitrate = max(100_000, int(target_bytes * 8 / duration * 0.90))
-    run([
-        ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-        "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30",
-        "-t", str(duration), "-an",
-        "-c:v", "libx264", "-preset", "veryfast", "-b:v", str(video_bitrate),
-        "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(path),
-    ])
+def make_stts() -> bytes:
+    # One time-to-sample entry: four samples, delta one.
+    payload = fullbox_payload() + struct.pack(">III", 1, 4, 1)
+    assert len(payload) == 16
+    return box(b"stts", payload)
 
 
-def build(source: Path, output: Path, all_tracks: bool) -> None:
-    entries = top_level(source)
-    moov_info = next((entry for entry in entries if entry[0] == b"moov"), None)
-    if moov_info is None:
-        raise ValueError("source has no moov")
-    _, moov_offset, moov_size = moov_info
-    with source.open("rb") as handle:
-        handle.seek(moov_offset)
-        moov = parse_boxes(handle.read(moov_size))[0]
-    old_size = moov.size
-    added = append_empty_minf(moov, all_tracks)
-    delta = moov.size - old_size
-    shifted = shift_offsets(moov, delta)
-    print(f"Added {added} empty duplicate minf box(es), each exactly 8 bytes")
-    print(f"moov grew by {delta} bytes; shifted {shifted} valid chunk offset entries")
-    output.parent.mkdir(parents=True, exist_ok=True)
-    replacement = moov.to_bytes()
-    with source.open("rb") as src, output.open("wb") as dst:
-        for box_type, offset, size in entries:
-            if box_type == b"moov":
-                dst.write(replacement)
-            else:
-                src.seek(offset)
-                dst.write(src.read(size))
+def make_stsc() -> bytes:
+    # One chunk-map entry: chunk 1, four samples/chunk, description 1.
+    payload = fullbox_payload() + struct.pack(">IIII", 1, 1, 4, 1)
+    assert len(payload) == 20
+    return box(b"stsc", payload)
+
+
+def make_stsz() -> bytes:
+    # Variable sample sizes: four samples, each 16 bytes.
+    payload = fullbox_payload() + struct.pack(">II", 0, 4) + struct.pack(">IIII", 16, 16, 16, 16)
+    assert len(payload) == 28
+    return box(b"stsz", payload)
+
+
+def make_stco() -> bytes:
+    # One chunk at absolute file offset 0x200, as in the reproducer.
+    payload = fullbox_payload() + struct.pack(">II", 1, 0x200)
+    assert len(payload) == 12
+    return box(b"stco", payload)
+
+
+def make_fixture() -> bytes:
+    stbl = box(b"stbl", b"".join((
+        make_stsd(),    # 16
+        make_stts(),    # 24
+        make_stsc(),    # 28
+        make_stsz(),    # 36
+        make_stco(),    # 20
+    )))                 # 132
+    first_minf = box(b"minf", stbl)       # 140
+    second_minf = box(b"minf")             # exactly 8, no children
+
+    mdia = box(b"mdia", b"".join((
+        make_mdhd(),    # 32
+        make_hdlr(),    # 33
+        first_minf,     # 140
+        second_minf,    # 8
+    )))                 # 221
+    trak = box(b"trak", make_tkhd() + mdia)  # 321
+    moov = box(b"moov", make_mvhd() + trak)  # 437
+    output = make_ftyp() + moov + box(b"mdat")
+
+    # Verify the exact sizes and relative positions described by the bug.
+    assert len(make_ftyp()) == 24
+    assert len(make_mvhd()) == 108
+    assert len(make_tkhd()) == 92
+    assert len(make_mdhd()) == 32
+    assert len(make_hdlr()) == 33
+    assert len(first_minf) == 140
+    assert len(stbl) == 132
+    assert len(second_minf) == 8
+    assert len(mdia) == 221
+    assert len(trak) == 321
+    assert len(moov) == 437
+    assert len(output) == 469
+
+    # trak-relative positions: trak header at 0, tkhd starts at 8.
+    # mdia starts at 100; mdia children: mdhd 8..40, hdlr 40..73,
+    # minf header 73..81, stbl header 81..89.
+    stbl_start = 8 + 92 + 8 + 32 + 33 + 8 + 8
+    assert stbl_start == 181
+    prependsz = stbl_start + 8
+    stbl_end = stbl_start + len(stbl)
+    minf_offset = stbl_end - 8
+    assert prependsz == 189
+    assert minf_offset == 305
+    assert minf_offset >= prependsz  # the vulnerable assertion is expected to fail
+
+    return output
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    default = Path(__file__).resolve().parent / "output" / "mp4_empty_duplicate_minf.mp4"
-    parser.add_argument("--output", type=Path, default=default)
-    parser.add_argument("--size", type=int, default=DEFAULT_TARGET)
-    parser.add_argument("--duration", type=float, default=DEFAULT_DURATION)
-    parser.add_argument("--all-tracks", action="store_true",
-                        help="also append empty minf under audio mdia; default is video only")
+    parser.add_argument(
+        "--output", type=Path,
+        default=Path(__file__).resolve().parent / "output" / "minimal_duplicate_minf.mp4",
+    )
     args = parser.parse_args()
-    try:
-        ffprobe = tool("ffprobe")
-        with tempfile.TemporaryDirectory() as tmp:
-            source = Path(tmp) / "source.mp4"
-            encode_source(source, args.size, args.duration)
-            run([ffprobe, "-v", "error", "-select_streams", "v:0",
-                 "-show_entries", "stream=codec_name,width,height",
-                 "-of", "default=noprint_wrappers=1", str(source)])
-            build(source, args.output, args.all_tracks)
-        print(f"Created {args.output} ({args.output.stat().st_size:,} bytes)")
-        print("Expected video layout: complete minf/stbl followed immediately by minf size=8")
-        return 0
-    except (RuntimeError, ValueError, subprocess.CalledProcessError) as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
+    data = make_fixture()
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_bytes(data)
+    print(f"Created {args.output} ({len(data)} bytes)")
+    print("Expected boxes: ftyp=24, mvhd=108, tkhd=92, mdhd=32, hdlr=33")
+    print("Expected boxes: stsd=16, stts=24, stsc=28, stsz=36, stco=20")
+    print("Expected layout: complete minf/stbl followed by empty minf size=8")
+    print("Expected assertion values: prependsz=189, minf_offset=305")
+    return 0
 
 
 if __name__ == "__main__":
