@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate two intentionally malformed, ~1 MiB MP4 box-tree test fixtures.
+"""Generate two intentionally malformed, ~100 MiB MP4 box-tree test fixtures.
 
 The second minf follows the first minf's stbl as a sibling in mdia; the
 second mdia follows the first mdia (whose minf ends in stbl) in trak.
@@ -11,7 +11,7 @@ import argparse
 from pathlib import Path
 import struct
 
-DEFAULT_SIZE = 1024 * 1024  # 1 MiB, exactly 1,048,576 bytes
+DEFAULT_SIZE = 100 * 1024 * 1024  # 100 MiB, exactly 104,857,600 bytes
 
 
 def box(kind, payload=b''):
@@ -109,7 +109,7 @@ def generate(output_file, duplicate, target_size=DEFAULT_SIZE):
         output.write(struct.pack('>I4s', padding + 8, b'mdat'))
         # Write bounded chunks rather than allocating a large zero buffer.
         while padding:
-            length = min(padding, 64 * 1024)
+            length = min(padding, 1024 * 1024)
             output.write(b'\0' * length)
             padding -= length
     return path
@@ -126,11 +126,11 @@ def generate_mp4_with_duplicate_mdia(output_file, target_size=DEFAULT_SIZE):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--size', type=int, default=DEFAULT_SIZE,
-                        help='output size in bytes for EACH file (default: 1048576 = 1 MiB)')
+                        help='output size in bytes for EACH file (default: 104857600 = 100 MiB)')
     parser.add_argument('--output-dir', type=Path, default=Path(__file__).resolve().parent / 'output')
     args = parser.parse_args()
-    for kind, name in (('minf', 'mp4_with_duplicate_minf.mp4'),
-                       ('mdia', 'mp4_with_duplicate_mdia.mp4')):
+    for kind, name in (('minf', 'mp4_with_duplicate_minf_100mb.mp4'),
+                       ('mdia', 'mp4_with_duplicate_mdia_100mb.mp4')):
         try:
             path = generate(args.output_dir / name, kind, args.size)
         except ValueError as exc:
