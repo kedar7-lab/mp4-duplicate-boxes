@@ -1,18 +1,9 @@
 #!/usr/bin/env python3
-"""Create a roughly 10 MiB MP4 with real H.264/AAC and nested empty duplicate minf.
-
-Structure:
-  mdia
-    mdhd
-    hdlr
-    minf (genuine)
-      vmhd
-      dinf
-      stbl
-        stsd, stts, stsc, stsz, stco
-      minf (size=8)    ← empty duplicate, immediately after stbl
+"""Create a roughly 10 MiB MP4 with H.264/AAC and an empty duplicate minf
+immediately after stbl in both the video and audio tracks.
 """
 from __future__ import annotations
+
 import argparse
 import shutil
 import struct
@@ -22,7 +13,7 @@ import tempfile
 from pathlib import Path
 
 DEFAULT_TARGET = 10_485_760  # 10 MiB
-DEFAULT_DURATION = 30.0  # 30 seconds for larger file
+DEFAULT_DURATION = 30.0
 CONTAINERS = {b"moov", b"trak", b"mdia", b"minf", b"stbl", b"dinf", b"edts", b"udta"}
 
 
@@ -48,7 +39,8 @@ class Box:
 
     @property
     def size(self) -> int:
-        return 8 + (len(self.payload) if self.children is None else sum(c.size for c in self.children))
+        body_size = len(self.payload) if self.children is None else sum(c.size for c in self.children)
+        return 8 + body_size
 
     def to_bytes(self) -> bytes:
         body = self.payload if self.children is None else b"".join(c.to_bytes() for c in self.children)
@@ -62,7 +54,7 @@ class Box:
 
 
 def parse_boxes(data: bytes) -> list[Box]:
-    boxes: list[Box] = []
+    result: list[Box] = []
     offset = 0
     while offset < len(data):
         if len(data) - offset < 8:
@@ -74,15 +66,15 @@ def parse_boxes(data: bytes) -> list[Box]:
             raise ValueError(f"unsupported or invalid {box_type!r} box")
         body = data[offset + 8:offset + size]
         if box_type in CONTAINERS:
-            boxes.append(Box(box_type, children=parse_boxes(body)))
+            result.append(Box(box_type, children=parse_boxes(body)))
         else:
-            boxes.append(Box(box_type, body))
+            result.append(Box(box_type, body))
         offset += size
-    return boxes
+    return result
 
 
 def top_level(path: Path) -> list[tuple[bytes, int, int]]:
-    result = []
+    result: list[tuple[bytes, int, int]] = []
     total = path.stat().st_size
     with path.open("rb") as handle:
         offset = 0
@@ -94,9 +86,7 @@ def top_level(path: Path) -> list[tuple[bytes, int, int]]:
             size, box_type = struct.unpack(">I4s", header)
             if size == 0:
                 size = total - offset
-            if size == 1:
-                raise ValueError("extended-size top-level boxes are unsupported")
-            if size < 8 or offset + size > total:
+            if size == 1 or size < 8 or offset + size > total:
                 raise ValueError(f"invalid top-level {box_type!r}")
             result.append((box_type, offset, size))
             offset += size
@@ -118,65 +108,43 @@ def shift_chunk_offsets(moov: Box, delta: int) -> int:
     return changed
 
 
-def inject_empty_nested_duplicate_minf(moov: Box) -> int:
-    """Insert an empty (8-byte) duplicate minf immediately after stbl inside the genuine minf.
+def handler_type(mdia: Box) -> bytes:
+    hdlr = next((c for c in mdia.children or () if c.type == b"hdlr"), None)
+    if hdlr is None or len(hdlr.payload) < 12:
+        return b"????"
+    return hdlr.payload[8:12]
 
-    Structure:
-      minf (genuine)
-        vmhd
-        dinf
-        stbl
-          stsd, stts, stsc, stsz, stco
-        minf (size=8)    ← empty duplicate
-    """
+
+def inject_empty_duplicate_minf(moov: Box) -> int:
+    """Add an empty 8-byte minf after stbl in every media track."""
     injected = 0
-
     for trak in moov.find_all(b"trak"):
-        mdia = next(
-            (child for child in trak.children or () if child.type == b"mdia"),
-            None,
-        )
-        if mdia is None:
+        mdia = next((c for c in trak.children or () if c.type == b"mdia"), None)
+        if mdia is None or not mdia.children:
             continue
 
-        hdlr = next(
-            (child for child in mdia.children or () if child.type == b"hdlr"),
+        genuine_minf_index = next(
+            (i for i, child in enumerate(mdia.children) if child.type == b"minf"),
             None,
         )
-        if hdlr is None or len(hdlr.payload) < 12:
+        if genuine_minf_index is None:
             continue
-
-        if hdlr.payload[8:12] != b"vide":
-            continue
-
-        genuine_minf = next(
-            (child for child in mdia.children or () if child.type == b"minf"),
-            None,
-        )
-        if genuine_minf is None or not genuine_minf.children:
+        genuine_minf = mdia.children[genuine_minf_index]
+        if not genuine_minf.children:
             continue
 
         stbl_index = next(
-            (
-                index
-                for index, child in enumerate(genuine_minf.children)
-                if child.type == b"stbl"
-            ),
+            (i for i, child in enumerate(genuine_minf.children) if child.type == b"stbl"),
             None,
         )
         if stbl_index is None:
             continue
 
-        # Create an empty 8-byte minf (just the box header, no children)
-        empty_duplicate_minf = Box(b"minf")
-
-        # Insert immediately after stbl, inside the genuine minf
-        genuine_minf.children.insert(stbl_index + 1, empty_duplicate_minf)
+        # Box(b"minf") has no children and serializes as exactly 8 bytes:
+        # 00 00 00 08 6d 69 6e 66
+        genuine_minf.children.insert(stbl_index + 1, Box(b"minf"))
         injected += 1
-        print(
-            f"Injected empty (size=8) duplicate minf immediately after stbl "
-            f"inside genuine minf"
-        )
+        print(f"Injected empty size=8 duplicate minf in {handler_type(mdia).decode(errors='replace')} track")
 
     return injected
 
@@ -201,17 +169,16 @@ def encode_source(path: Path, target_bytes: int, duration: float) -> None:
 
 def build(source: Path, output: Path) -> None:
     entries = top_level(source)
-    moov_type, moov_offset, moov_size = next(e for e in entries if e[0] == b"moov")
-    file_size = source.stat().st_size
-
+    _, moov_offset, moov_size = next(e for e in entries if e[0] == b"moov")
     with source.open("rb") as handle:
         handle.seek(moov_offset)
         moov = parse_boxes(handle.read(moov_size))[0]
 
     old_size = moov.size
-    injected = inject_empty_nested_duplicate_minf(moov)
-    if not injected:
-        raise ValueError("no video track found")
+    injected = inject_empty_duplicate_minf(moov)
+    if injected != 2:
+        raise ValueError(f"expected video and audio tracks, injected {injected} duplicate minf boxes")
+
     delta = moov.size - old_size
     shifted = shift_chunk_offsets(moov, delta)
     replacement = moov.to_bytes()
@@ -223,7 +190,7 @@ def build(source: Path, output: Path) -> None:
             else:
                 src.seek(offset)
                 dst.write(src.read(size))
-    print(f"Injected {injected} empty duplicate minf; moov grew {delta} bytes; shifted {shifted} offsets")
+    print(f"Injected {injected} duplicate minf boxes; moov grew {delta} bytes; shifted {shifted} offsets")
 
 
 def main() -> int:
@@ -236,19 +203,14 @@ def main() -> int:
         ffprobe = tool("ffprobe")
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp) / "source.mp4"
-            print("Encoding source video (30 seconds)...")
+            print(f"Encoding source video/audio ({args.duration:g} seconds)...")
             encode_source(source, args.size, args.duration)
-            run([ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name,width,height", "-of", "default=noprint_wrappers=1", str(source)])
-            print("Building 10 MiB MP4 with nested empty duplicate minf...")
+            run([ffprobe, "-v", "error", "-show_entries", "stream=index,codec_type,codec_name", "-of", "default=noprint_wrappers=1", str(source)])
+            print("Adding empty duplicate minf to video and audio tracks...")
             build(source, args.output)
         size = args.output.stat().st_size
         print(f"Created {args.output} ({size:,} bytes, {size / (1024 * 1024):.2f} MiB)")
-        print("Structure:")
-        print("  minf (genuine)")
-        print("    vmhd")
-        print("    dinf")
-        print("    stbl (stsd, stts, stsc, stsz, stco)")
-        print("    minf (size=8, empty duplicate)")
+        print("Both tracks contain: minf > stbl > minf(size=8)")
         return 0
     except (RuntimeError, ValueError, subprocess.CalledProcessError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
