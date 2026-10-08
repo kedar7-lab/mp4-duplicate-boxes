@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
-"""Create a roughly 10 MiB MP4 with H.264/AAC and an empty duplicate minf
-immediately after stbl in both the video and audio tracks.
+"""Create a roughly 10 MiB MP4 with H.264/AAC and padded duplicate minf
+(size >= 16) immediately after stbl in both video and audio tracks.
+
+The duplicate minf is padded to exactly 16 bytes (8-byte header + 8 bytes of filler)
+so it passes the EXT_ATOM_HEADER_SZ threshold and gets parsed, overwriting the
+m_non_leaves["minf"] pointer and triggering assert(minf_offset < prependsz).
 """
 from __future__ import annotations
 
@@ -115,8 +119,19 @@ def handler_type(mdia: Box) -> bytes:
     return hdlr.payload[8:12]
 
 
-def inject_empty_duplicate_minf(moov: Box) -> int:
-    """Add an empty 8-byte minf after stbl in every media track."""
+def inject_padded_duplicate_minf(moov: Box) -> int:
+    """Add a padded (size=16) duplicate minf after stbl in every media track.
+    
+    The duplicate minf is padded with 8 bytes of zero content so its total size
+    is 16 bytes (8-byte header + 8 bytes filler). This ensures it passes the
+    EXT_ATOM_HEADER_SZ threshold (16 bytes) in trak.cpp:620 and gets parsed,
+    overwriting m_non_leaves["minf"] and triggering the original assertion.
+    
+    Size breakdown:
+      - 4 bytes: size field (0x00000010 = 16)
+      - 4 bytes: type field ('minf')
+      - 8 bytes: filler/padding (0x00000000 0x00000000)
+    """
     injected = 0
     for trak in moov.find_all(b"trak"):
         mdia = next((c for c in trak.children or () if c.type == b"mdia"), None)
@@ -140,11 +155,16 @@ def inject_empty_duplicate_minf(moov: Box) -> int:
         if stbl_index is None:
             continue
 
-        # Box(b"minf") has no children and serializes as exactly 8 bytes:
-        # 00 00 00 08 6d 69 6e 66
-        genuine_minf.children.insert(stbl_index + 1, Box(b"minf"))
+        # Create a minf box with 8 bytes of padding/filler payload
+        # Total size = 8 (header) + 8 (payload) = 16 bytes
+        # This passes EXT_ATOM_HEADER_SZ threshold and gets parsed
+        padding = b"\x00" * 8
+        duplicate_minf = Box(b"minf", payload=padding)
+        
+        genuine_minf.children.insert(stbl_index + 1, duplicate_minf)
         injected += 1
-        print(f"Injected empty size=8 duplicate minf in {handler_type(mdia).decode(errors='replace')} track")
+        track_type = handler_type(mdia).decode(errors='replace')
+        print(f"Injected padded (size=16) duplicate minf in {track_type} track")
 
     return injected
 
@@ -175,7 +195,7 @@ def build(source: Path, output: Path) -> None:
         moov = parse_boxes(handle.read(moov_size))[0]
 
     old_size = moov.size
-    injected = inject_empty_duplicate_minf(moov)
+    injected = inject_padded_duplicate_minf(moov)
     if injected != 2:
         raise ValueError(f"expected video and audio tracks, injected {injected} duplicate minf boxes")
 
@@ -190,12 +210,12 @@ def build(source: Path, output: Path) -> None:
             else:
                 src.seek(offset)
                 dst.write(src.read(size))
-    print(f"Injected {injected} duplicate minf boxes; moov grew {delta} bytes; shifted {shifted} offsets")
+    print(f"Injected {injected} padded duplicate minf boxes; moov grew {delta} bytes; shifted {shifted} offsets")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, default=Path(__file__).resolve().parent / "output" / "10mb_nested_empty_duplicate_minf.mp4")
+    parser.add_argument("--output", type=Path, default=Path(__file__).resolve().parent / "output" / "10mb_nested_padded_duplicate_minf.mp4")
     parser.add_argument("--size", type=int, default=DEFAULT_TARGET)
     parser.add_argument("--duration", type=float, default=DEFAULT_DURATION)
     args = parser.parse_args()
@@ -206,11 +226,18 @@ def main() -> int:
             print(f"Encoding source video/audio ({args.duration:g} seconds)...")
             encode_source(source, args.size, args.duration)
             run([ffprobe, "-v", "error", "-show_entries", "stream=index,codec_type,codec_name", "-of", "default=noprint_wrappers=1", str(source)])
-            print("Adding empty duplicate minf to video and audio tracks...")
+            print("Adding padded (size=16) duplicate minf to video and audio tracks...")
             build(source, args.output)
         size = args.output.stat().st_size
         print(f"Created {args.output} ({size:,} bytes, {size / (1024 * 1024):.2f} MiB)")
-        print("Both tracks contain: minf > stbl > minf(size=8)")
+        print("")
+        print("Structure (passes EXT_ATOM_HEADER_SZ threshold):")
+        print("  video/audio minf")
+        print("    stbl")
+        print("    minf size=16+0 (8-byte header + 8-byte padding)")
+        print("")
+        print("This duplicate minf WILL be parsed and WILL overwrite m_non_leaves[\"minf\"],")
+        print("triggering assert(minf_offset < prependsz) on pre-fix trak.cpp")
         return 0
     except (RuntimeError, ValueError, subprocess.CalledProcessError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
